@@ -1,0 +1,2041 @@
+import os
+import re
+import json
+import asyncio
+import logging
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+import discord
+from discord import app_commands
+from discord.ext import commands
+import yt_dlp as youtube_dl
+import functools
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("OneDream")
+logger.setLevel(logging.INFO)
+
+file_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "bot.log"),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8"
+)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(file_handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(console_handler)
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    logger.critical("لم يتم العثور على DISCORD_TOKEN في متغيرات البيئة.")
+    TOKEN = "ODc2MjQ3NzI5OTU1ODAzMTY3.GYCEmD.reaysSo5Hn5Mjs68bfKeQFI9nbX3jRk-qDqMr8"
+
+OWNER_ID = 604008749077626900
+
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+VAULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vault_cloud")
+os.makedirs(VAULT_DIR, exist_ok=True)
+
+WHITELIST_FILE = "vault_whitelist.json"
+GHOST_STAFF_FILE = "ghost_staff.json"
+DM_LOG_FILE = "dm_log.json"
+AUDIT_LOG_FILE = "audit_log.json"
+PROTECTED_GUILDS_FILE = "protected_guilds.json"
+EMERGENCY_FILE = "emergency_state.json"
+BOT_STATUS_FILE = "bot_status.json"
+
+active_sessions = {}
+
+def load_json(filename, default=None):
+    if default is None:
+        default = {}
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"ملف {filename} تالف: {e}")
+        except Exception as e:
+            logger.error(f"فشل تحميل {filename}: {e}")
+    return default
+
+def save_json(filename, data):
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"فشل حفظ {filename}: {e}")
+
+def load_whitelist_set(filename):
+    data = load_json(filename)
+    ids = []
+    if isinstance(data, dict):
+        ids = data.get("ids", [])
+    elif isinstance(data, list):
+        ids = data
+    return set(ids)
+
+vault_whitelist = load_whitelist_set(WHITELIST_FILE)
+ghost_staff = load_json(GHOST_STAFF_FILE, {})
+dm_log = load_json(DM_LOG_FILE, {})
+audit_log = load_json(AUDIT_LOG_FILE, [])
+protected_guilds = set(load_json(PROTECTED_GUILDS_FILE, []))
+emergency_state = load_json(EMERGENCY_FILE, {"active": False})
+bot_status_data = load_json(BOT_STATUS_FILE, {"status": "online"})
+
+def save_vault_whitelist():
+    save_json(WHITELIST_FILE, {"ids": list(vault_whitelist)})
+
+def save_ghost_staff():
+    save_json(GHOST_STAFF_FILE, ghost_staff)
+
+def save_dm_log():
+    save_json(DM_LOG_FILE, dm_log)
+
+def save_audit_log():
+    save_json(AUDIT_LOG_FILE, audit_log[-500:])
+
+def save_protected_guilds():
+    save_json(PROTECTED_GUILDS_FILE, list(protected_guilds))
+
+def save_emergency_state():
+    save_json(EMERGENCY_FILE, emergency_state)
+
+def save_bot_status():
+    save_json(BOT_STATUS_FILE, bot_status_data)
+
+def add_audit_entry(action, performed_by, target, guild_name=""):
+    audit_log.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "performed_by": str(performed_by),
+        "target": str(target),
+        "guild": guild_name
+    })
+    save_audit_log()
+
+def cleanup_temp_files():
+    try:
+        for fname in os.listdir(TEMP_DIR):
+            fpath = os.path.join(TEMP_DIR, fname)
+            try:
+                os.remove(fpath)
+            except:
+                pass
+    except:
+        pass
+
+def is_vault_allowed(user_id):
+    if user_id == OWNER_ID:
+        return True
+    role = ghost_staff.get(str(user_id))
+    if role in ("co-owner", "moderator"):
+        return True
+    return user_id in vault_whitelist
+
+def get_ghost_role(user_id):
+    if user_id == OWNER_ID:
+        return "owner"
+    return ghost_staff.get(str(user_id))
+
+def is_ghost_allowed(user_id):
+    return get_ghost_role(user_id) is not None
+
+def is_ghost_admin(user_id):
+    role = get_ghost_role(user_id)
+    return role in ("owner", "co-owner")
+
+def is_emergency_allowed(user_id):
+    return user_id == OWNER_ID
+
+async def fetch_user_name(user_id):
+    try:
+        user = await bot.fetch_user(user_id)
+        return f"{user.name} (ID: {user_id})"
+    except:
+        return f"مستخدم غير معروف (ID: {user_id})"
+
+async def set_bot_presence():
+    status_map = {
+        "online": discord.Status.online,
+        "idle": discord.Status.idle,
+        "dnd": discord.Status.dnd,
+        "invisible": discord.Status.invisible,
+    }
+    await bot.change_presence(status=status_map.get(bot_status_data.get("status", "online"), discord.Status.online))
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+intents.bans = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+user_cooldowns = {}
+
+def check_cooldown(user_id, seconds=5):
+    now = datetime.now(timezone.utc)
+    if user_id in user_cooldowns:
+        last_used = user_cooldowns[user_id]
+        if (now - last_used).total_seconds() < seconds:
+            return False, seconds - int((now - last_used).total_seconds())
+    user_cooldowns[user_id] = now
+    return True, 0
+
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
+
+# ==================== نظام الموسيقى الكامل (مُحسَّن) ====================
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0'
+}
+
+ffmpeg_options = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+
+queues = {}
+now_playing = {}
+loop_states = {}
+board_messages = {}
+board_tasks = {}
+volume_levels = {}
+
+def get_queue(guild_id):
+    if guild_id not in queues:
+        queues[guild_id] = asyncio.Queue()
+    return queues[guild_id]
+
+def is_loop_on(guild_id):
+    return loop_states.get(guild_id, False)
+
+def set_loop(guild_id, state: bool):
+    loop_states[guild_id] = state
+
+def get_volume(guild_id):
+    return volume_levels.get(guild_id, 1.0)
+
+def set_volume(guild_id, vol):
+    volume_levels[guild_id] = max(0.0, min(2.0, vol))
+
+def get_vc(guild_id):
+    for vc in bot.voice_clients:
+        if vc.guild.id == guild_id:
+            return vc
+    return None
+
+async def update_board(guild_id):
+    msg = board_messages.get(guild_id)
+    if not msg:
+        return
+    try:
+        track = now_playing.get(guild_id)
+        if not track:
+            return
+        embed = build_board_embed(guild_id)
+        view = MusicControlView(guild_id)
+        await msg.edit(embed=embed, view=view)
+    except discord.NotFound:
+        stop_board_update(guild_id)
+    except Exception:
+        pass
+
+async def board_updater(guild_id):
+    while guild_id in board_messages:
+        await asyncio.sleep(5)
+        await update_board(guild_id)
+
+def start_board_update(guild_id):
+    stop_board_update(guild_id)
+    task = asyncio.create_task(board_updater(guild_id))
+    board_tasks[guild_id] = task
+
+def stop_board_update(guild_id):
+    task = board_tasks.pop(guild_id, None)
+    if task:
+        task.cancel()
+    board_messages.pop(guild_id, None)
+
+def build_board_embed(guild_id):
+    track = now_playing.get(guild_id)
+    if not track:
+        return discord.Embed(title="🎵 لا توجد أغنية حالياً", color=discord.Color.dark_embed())
+
+    current_time = 0
+    if track.get('start_time'):
+        elapsed = (asyncio.get_event_loop().time() - track['start_time'])
+        if not track.get('paused', False):
+            current_time = min(int(elapsed), track['duration'])
+        else:
+            current_time = min(int(track.get('paused_at', 0)), track['duration'])
+
+    def fmt(sec):
+        return f"{sec//60:02d}:{sec%60:02d}"
+
+    total_secs = track['duration']
+    progress = current_time / total_secs if total_secs > 0 else 0
+    bar_length = 15
+    filled = int(bar_length * progress)
+    bar = "▬" * filled + "🔘" + "▬" * (bar_length - filled)
+
+    embed = discord.Embed(title=f"🎵 **يعمل الآن** 💿", color=discord.Color.green())
+    embed.add_field(name="🎶 الأغنية", value=track['title'], inline=False)
+    embed.add_field(name="👤 طلبها", value=track['requester'], inline=False)
+    embed.add_field(
+        name=f"⏱️ الوقت",
+        value=f"{bar}\n{fmt(current_time)} / {fmt(total_secs)}",
+        inline=False
+    )
+    embed.add_field(name="🔁 التكرار", value="ON 🔁" if is_loop_on(guild_id) else "OFF", inline=True)
+    embed.add_field(name="🔊 مستوى الصوت", value=f"{get_volume(guild_id):.1f}", inline=True)
+    embed.set_footer(text="💡 للمساعدة: /music help | أزرق للتحكم | أحمر للإيقاف")
+    return embed
+
+class MusicControlView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        vc = get_vc(self.guild_id)
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("❌ البوت غير متصل بروم صوتي.", ephemeral=True)
+            return False
+        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+            await interaction.response.send_message("❌ يجب أن تكون في نفس الروم الصوتي.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⏸️ إيقاف", style=discord.ButtonStyle.primary, row=0)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = get_vc(self.guild_id)
+        if not vc: return
+        track = now_playing.get(self.guild_id)
+        if vc.is_playing():
+            vc.pause()
+            if track: track['paused'] = True; track['paused_at'] = asyncio.get_event_loop().time() - track['start_time']
+            button.label = "▶️ استئناف"
+        elif vc.is_paused():
+            vc.resume()
+            if track: track['paused'] = False; track['start_time'] = asyncio.get_event_loop().time() - (track.get('paused_at', 0))
+            button.label = "⏸️ إيقاف"
+        await interaction.response.defer()
+        await update_board(self.guild_id)
+
+    @discord.ui.button(label="⏭️ تخطي", style=discord.ButtonStyle.primary, row=0)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = get_vc(self.guild_id)
+        if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="🔁 تكرار", style=discord.ButtonStyle.primary, row=0)
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = self.guild_id
+        current = is_loop_on(gid)
+        set_loop(gid, not current)
+        button.label = f"🔁 تكرار: {'ON' if not current else 'OFF'}"
+        await interaction.response.defer()
+        await update_board(gid)
+
+    @discord.ui.button(label="🔊 +", style=discord.ButtonStyle.primary, row=1)
+    async def vol_up_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = get_vc(self.guild_id)
+        if vc and vc.source:
+            try:
+                new_vol = min(2.0, get_volume(self.guild_id) + 0.2)
+                vc.source.volume = new_vol
+                set_volume(self.guild_id, new_vol)
+                await interaction.response.send_message(f"🔊 الصوت: {new_vol:.1f}", ephemeral=True)
+                await update_board(self.guild_id)
+            except AttributeError:
+                await interaction.response.send_message("❌ لا يمكن تعديل الصوت على هذا المصدر.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ لا يوجد صوت نشط.", ephemeral=True)
+
+    @discord.ui.button(label="🔉 -", style=discord.ButtonStyle.primary, row=1)
+    async def vol_down_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = get_vc(self.guild_id)
+        if vc and vc.source:
+            try:
+                new_vol = max(0.0, get_volume(self.guild_id) - 0.2)
+                vc.source.volume = new_vol
+                set_volume(self.guild_id, new_vol)
+                await interaction.response.send_message(f"🔉 الصوت: {new_vol:.1f}", ephemeral=True)
+                await update_board(self.guild_id)
+            except AttributeError:
+                await interaction.response.send_message("❌ لا يمكن تعديل الصوت على هذا المصدر.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ لا يوجد صوت نشط.", ephemeral=True)
+
+    @discord.ui.button(label="🛑 خروج", style=discord.ButtonStyle.danger, row=1)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = self.guild_id
+        vc = get_vc(gid)
+        if vc:
+            queues.pop(gid, None)
+            now_playing.pop(gid, None)
+            stop_board_update(gid)
+            volume_levels.pop(gid, None)
+            await vc.disconnect()
+        await interaction.response.send_message("🛑 تم إيقاف الموسيقى.", ephemeral=True)
+
+async def play_next(guild_id):
+    queue = get_queue(guild_id)
+    vc = get_vc(guild_id)
+
+    if is_loop_on(guild_id) and now_playing.get(guild_id):
+        current = now_playing[guild_id].copy()
+        current['start_time'] = None
+        await queue.put(current)
+
+    if queue.empty():
+        if vc and vc.is_connected():
+            await vc.disconnect()
+        now_playing.pop(guild_id, None)
+        stop_board_update(guild_id)
+        return
+
+    track = await queue.get()
+    now_playing[guild_id] = {
+        'title': track['title'],
+        'url': track['url'],
+        'duration': track['duration'],
+        'requester': track.get('requester', 'مجهول'),
+        'start_time': asyncio.get_event_loop().time(),
+        'paused': False,
+        'paused_at': 0
+    }
+
+    if not vc or not vc.is_connected():
+        return
+
+    loop = asyncio.get_event_loop()
+    try:
+        partial = functools.partial(ytdl.extract_info, track['url'], download=False)
+        data = await loop.run_in_executor(None, partial)
+        if 'entries' in data:
+            data = data['entries'][0]
+        audio_url = data['url']
+        source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
+        vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop))
+        if guild_id in board_messages:
+            start_board_update(guild_id)
+    except Exception as e:
+        logger.error(f"خطأ في التشغيل: {e}")
+        await play_next(guild_id)
+
+async def search_youtube(query):
+    loop = asyncio.get_event_loop()
+    try:
+        partial = functools.partial(ytdl.extract_info, f"ytsearch:{query}", download=False)
+        data = await loop.run_in_executor(None, partial)
+        if 'entries' in data and len(data['entries']) > 0:
+            entry = data['entries'][0]
+            return {
+                'title': entry.get('title', 'غير معروف'),
+                'url': entry.get('webpage_url', query),
+                'duration': entry.get('duration', 0)
+            }
+    except:
+        pass
+    return None
+
+@bot.tree.command(name="music", description="تشغيل والتحكم في الموسيقى")
+@app_commands.describe(action="اختر الإجراء", query="اسم الأغنية أو الرابط")
+@app_commands.choices(action=[
+    app_commands.Choice(name="مساعدة", value="help"),
+    app_commands.Choice(name="تشغيل", value="play"),
+    app_commands.Choice(name="إيقاف مؤقت", value="pause"),
+    app_commands.Choice(name="استئناف", value="resume"),
+    app_commands.Choice(name="تخطي", value="skip"),
+    app_commands.Choice(name="تكرار (تشغيل/إيقاف)", value="loop"),
+    app_commands.Choice(name="رفع الصوت", value="volup"),
+    app_commands.Choice(name="خفض الصوت", value="voldown"),
+    app_commands.Choice(name="إعادة من البداية", value="replay"),
+    app_commands.Choice(name="إيقاف نهائي", value="stop"),
+])
+async def music_command(interaction: discord.Interaction, action: str, query: str = None):
+    if emergency_state.get("active") and not is_emergency_allowed(interaction.user.id):
+        return await interaction.response.send_message("🚨 البوت في حالة طوارئ قصوى.", ephemeral=True)
+
+    if action == "help":
+        embed = discord.Embed(
+            title="📖 **دليل أوامر الموسيقى**",
+            description="━━━━━━━━━━━━━━━━━━━━━━",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="🎵 /music play <اسم/رابط>", value="تشغيل أغنية", inline=False)
+        embed.add_field(name="⏸️ /music pause", value="إيقاف مؤقت", inline=False)
+        embed.add_field(name="▶️ /music resume", value="استئناف", inline=False)
+        embed.add_field(name="⏭️ /music skip", value="تخطي", inline=False)
+        embed.add_field(name="🔁 /music loop", value="تكرار ON/OFF", inline=False)
+        embed.add_field(name="🔊 /music volup", value="رفع الصوت", inline=False)
+        embed.add_field(name="🔉 /music voldown", value="خفض الصوت", inline=False)
+        embed.add_field(name="⏪ /music replay", value="إعادة من البداية", inline=False)
+        embed.add_field(name="🛑 /music stop", value="إيقاف نهائي", inline=False)
+        embed.set_footer(text="💡 استخدم الأزرقاء للتحكم، الأحمر للإيقاف")
+        await interaction.response.send_message(embed=embed)
+        return
+
+    if action == "play":
+        if not query:
+            await interaction.response.send_message("❌ يجب كتابة اسم الأغنية أو رابط.", ephemeral=True)
+            return
+        await play_music(interaction, query)
+    elif action == "pause":
+        await pause_music(interaction)
+    elif action == "resume":
+        await resume_music(interaction)
+    elif action == "skip":
+        await skip_music(interaction)
+    elif action == "loop":
+        await loop_toggle(interaction)
+    elif action == "volup":
+        await volume_change(interaction, up=True)
+    elif action == "voldown":
+        await volume_change(interaction, up=False)
+    elif action == "replay":
+        await replay_music(interaction)
+    elif action == "stop":
+        await stop_music(interaction)
+
+async def play_music(interaction: discord.Interaction, query: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ يجب أن تكون في روم صوتي.", ephemeral=True)
+        return
+    channel = interaction.user.voice.channel
+    await interaction.response.defer()
+
+    track = None
+    if query.startswith("http"):
+        track = {'title': 'جاري التحميل...', 'url': query, 'duration': 0}
+    else:
+        track = await search_youtube(query)
+    if not track:
+        await interaction.followup.send("❌ لم يتم العثور على الأغنية.")
+        return
+
+    track['requester'] = interaction.user.display_name
+    guild_id = interaction.guild_id
+    vc = get_vc(guild_id)
+
+    if not vc or not vc.is_connected():
+        try:
+            vc = await channel.connect()
+        except Exception as e:
+            await interaction.followup.send(f"❌ فشل الاتصال بالروم: {e}")
+            return
+    else:
+        if vc.channel != channel:
+            await vc.move_to(channel)
+
+    queue = get_queue(guild_id)
+    await queue.put(track)
+
+    if vc.is_playing() or vc.is_paused():
+        await interaction.followup.send(f"✅ تمت إضافة **{track['title']}** إلى الطابور.")
+    else:
+        await interaction.followup.send(f"🎵 جاري تشغيل **{track['title']}**")
+        await play_next(guild_id)
+
+    embed = build_board_embed(guild_id)
+    view = MusicControlView(guild_id)
+    msg = await interaction.followup.send(embed=embed, view=view)
+    board_messages[guild_id] = msg
+    start_board_update(guild_id)
+
+async def pause_music(interaction: discord.Interaction):
+    vc = get_vc(interaction.guild_id)
+    if vc and vc.is_playing():
+        vc.pause()
+        track = now_playing.get(interaction.guild_id)
+        if track:
+            track['paused'] = True
+            track['paused_at'] = asyncio.get_event_loop().time() - track['start_time']
+        await interaction.response.send_message("⏸️ تم الإيقاف المؤقت.", ephemeral=True)
+        await update_board(interaction.guild_id)
+    else:
+        await interaction.response.send_message("❌ لا توجد أغنية شغالة.", ephemeral=True)
+
+async def resume_music(interaction: discord.Interaction):
+    vc = get_vc(interaction.guild_id)
+    if vc and vc.is_paused():
+        vc.resume()
+        track = now_playing.get(interaction.guild_id)
+        if track:
+            track['paused'] = False
+            track['start_time'] = asyncio.get_event_loop().time() - track.get('paused_at', 0)
+        await interaction.response.send_message("▶️ تم الاستئناف.", ephemeral=True)
+        await update_board(interaction.guild_id)
+    else:
+        await interaction.response.send_message("❌ لا توجد أغنية متوقفة.", ephemeral=True)
+
+async def skip_music(interaction: discord.Interaction):
+    vc = get_vc(interaction.guild_id)
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop()
+        await interaction.response.send_message("⏭️ تم التخطي.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ لا توجد أغنية.", ephemeral=True)
+
+async def loop_toggle(interaction: discord.Interaction):
+    gid = interaction.guild_id
+    current = is_loop_on(gid)
+    set_loop(gid, not current)
+    state = "ON 🔁" if not current else "OFF"
+    await interaction.response.send_message(f"🔁 التكرار: {state}", ephemeral=True)
+    await update_board(gid)
+
+async def volume_change(interaction: discord.Interaction, up: bool):
+    gid = interaction.guild_id
+    vc = get_vc(gid)
+    if vc and vc.source:
+        try:
+            delta = 0.2 if up else -0.2
+            new_vol = max(0.0, min(2.0, get_volume(gid) + delta))
+            vc.source.volume = new_vol
+            set_volume(gid, new_vol)
+            await interaction.response.send_message(f"🔊 الصوت: {new_vol:.1f}", ephemeral=True)
+            await update_board(gid)
+        except AttributeError:
+            await interaction.response.send_message("❌ لا يمكن تعديل الصوت على هذا المصدر.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ لا يوجد صوت نشط.", ephemeral=True)
+
+async def replay_music(interaction: discord.Interaction):
+    gid = interaction.guild_id
+    vc = get_vc(gid)
+    if not vc or not (vc.is_playing() or vc.is_paused()):
+        await interaction.response.send_message("❌ لا توجد أغنية لإعادتها.", ephemeral=True)
+        return
+    track = now_playing.get(gid)
+    if not track:
+        await interaction.response.send_message("❌ لا توجد بيانات للأغنية.", ephemeral=True)
+        return
+    vc.stop()
+    new_track = track.copy()
+    new_track['start_time'] = None
+    new_track['requester'] = track.get('requester', 'مجهول')
+    queue = get_queue(gid)
+    items = []
+    while not queue.empty():
+        items.append(await queue.get())
+    new_queue = asyncio.Queue()
+    await new_queue.put(new_track)
+    for item in items:
+        await new_queue.put(item)
+    queues[gid] = new_queue
+    await interaction.response.send_message("⏪ تمت إعادة الأغنية من البداية.", ephemeral=True)
+
+async def stop_music(interaction: discord.Interaction):
+    gid = interaction.guild_id
+    vc = get_vc(gid)
+    if vc:
+        queues.pop(gid, None)
+        now_playing.pop(gid, None)
+        stop_board_update(gid)
+        volume_levels.pop(gid, None)
+        await vc.disconnect()
+    await interaction.response.send_message("🛑 تم إيقاف الموسيقى نهائياً.", ephemeral=True)
+
+# ==================== النسخ الاحتياطي ====================
+def build_tree_view(guild):
+    lines = [f"📁 {guild.name}"]
+    categories = {}
+    no_category_channels = []
+    for channel in guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            categories[channel.id] = {"category": channel, "channels": []}
+        else:
+            if channel.category:
+                if channel.category.id not in categories:
+                    categories[channel.category.id] = {"category": channel.category, "channels": []}
+                categories[channel.category.id]["channels"].append(channel)
+            else:
+                no_category_channels.append(channel)
+    for cat_id, cat_data in categories.items():
+        cat = cat_data["category"]
+        lines.append(f"├── 📁 {cat.name}")
+        for ch in sorted(cat_data["channels"], key=lambda x: x.position):
+            if isinstance(ch, discord.TextChannel):
+                lines.append(f"│   ├── 💬 {ch.name}")
+            elif isinstance(ch, discord.VoiceChannel):
+                lines.append(f"│   ├── 🔊 {ch.name}")
+        lines[-1] = lines[-1].replace("├──", "└──")
+    if no_category_channels:
+        lines.append("└── (بدون فئة)")
+        for ch in sorted(no_category_channels, key=lambda x: x.position):
+            if isinstance(ch, discord.TextChannel):
+                lines.append(f"    ├── 💬 {ch.name}")
+            elif isinstance(ch, discord.VoiceChannel):
+                lines.append(f"    ├── 🔊 {ch.name}")
+    lines.append(f"🔐 الرُتَب: {', '.join(r.name for r in guild.roles if not r.is_default() and not r.managed)}")
+    return "\n".join(lines)
+
+def create_backup_data(guild):
+    roles = []
+    for role in guild.roles:
+        roles.append({
+            "id": role.id, "name": role.name, "color": role.color.value,
+            "permissions": role.permissions.value, "hoist": role.hoist,
+            "mentionable": role.mentionable, "position": role.position,
+            "is_everyone": role.is_default()
+        })
+    categories, text_channels, voice_channels = [], [], []
+    for channel in guild.channels:
+        overwrites = []
+        for target, ow in channel.overwrites.items():
+            if isinstance(target, discord.Role):
+                allow, deny = ow.pair()
+                overwrites.append({"id": target.id, "type": "role", "allow": allow.value, "deny": deny.value})
+        if isinstance(channel, discord.CategoryChannel):
+            categories.append({"id": channel.id, "name": channel.name, "position": channel.position, "overwrites": overwrites})
+        elif isinstance(channel, discord.TextChannel):
+            text_channels.append({
+                "id": channel.id, "name": channel.name, "position": channel.position,
+                "category_id": channel.category.id if channel.category else None,
+                "topic": channel.topic or "", "nsfw": channel.nsfw,
+                "slowmode_delay": channel.slowmode_delay, "overwrites": overwrites
+            })
+        elif isinstance(channel, discord.VoiceChannel):
+            voice_channels.append({
+                "id": channel.id, "name": channel.name, "position": channel.position,
+                "category_id": channel.category.id if channel.category else None,
+                "bitrate": channel.bitrate, "user_limit": channel.user_limit, "overwrites": overwrites
+            })
+    return {
+        "guild_id": guild.id, "guild_name": guild.name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tree_view": build_tree_view(guild),
+        "roles": roles, "categories": categories,
+        "text_channels": text_channels, "voice_channels": voice_channels
+    }
+
+async def restore_backup(guild, backup_data):
+    me = guild.me
+    delete_tasks = []
+    for channel in guild.channels:
+        delete_tasks.append(channel.delete())
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+        await asyncio.sleep(1.0)
+
+    roles_to_delete = []
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        roles_to_delete.append(role)
+    for i in range(0, len(roles_to_delete), 5):
+        batch = roles_to_delete[i:i+5]
+        await asyncio.gather(*[r.delete() for r in batch], return_exceptions=True)
+        await asyncio.sleep(1.0)
+
+    category_map = {}
+    backup_roles = sorted(backup_data["roles"], key=lambda r: r["position"])
+    role_map = {}
+    for rdata in backup_roles:
+        if rdata["is_everyone"]:
+            everyone_role = guild.default_role
+            try:
+                await everyone_role.edit(permissions=discord.Permissions(rdata["permissions"]))
+            except Exception as e:
+                logger.error(f"فشل تعديل everyone role: {e}")
+            role_map[rdata["id"]] = everyone_role
+            continue
+        try:
+            new_role = await guild.create_role(
+                name=rdata["name"], color=discord.Color(rdata["color"]),
+                permissions=discord.Permissions(rdata["permissions"]),
+                hoist=rdata["hoist"], mentionable=rdata["mentionable"]
+            )
+            role_map[rdata["id"]] = new_role
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"فشل إنشاء رتبة {rdata['name']}: {e}")
+            continue
+
+    for cdata in sorted(backup_data["categories"], key=lambda c: c["position"]):
+        overwrites = {}
+        for ow in cdata["overwrites"]:
+            target_role = role_map.get(ow["id"])
+            if target_role:
+                overwrites[target_role] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
+                )
+        try:
+            new_cat = await guild.create_category(name=cdata["name"], overwrites=overwrites)
+            category_map[cdata["id"]] = new_cat
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"فشل إنشاء فئة {cdata['name']}: {e}")
+            continue
+
+    for chdata in sorted(backup_data["text_channels"], key=lambda c: c["position"]):
+        category = category_map.get(chdata["category_id"])
+        overwrites = {}
+        for ow in chdata["overwrites"]:
+            target_role = role_map.get(ow["id"])
+            if target_role:
+                overwrites[target_role] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
+                )
+        try:
+            await guild.create_text_channel(
+                name=chdata["name"], category=category, topic=chdata["topic"],
+                nsfw=chdata["nsfw"], slowmode_delay=chdata["slowmode_delay"], overwrites=overwrites
+            )
+            await asyncio.sleep(0.5)
+        except:
+            pass
+
+    for chdata in sorted(backup_data["voice_channels"], key=lambda c: c["position"]):
+        category = category_map.get(chdata["category_id"])
+        overwrites = {}
+        for ow in chdata["overwrites"]:
+            target_role = role_map.get(ow["id"])
+            if target_role:
+                overwrites[target_role] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
+                )
+        try:
+            await guild.create_voice_channel(
+                name=chdata["name"], category=category, bitrate=chdata["bitrate"],
+                user_limit=chdata["user_limit"], overwrites=overwrites
+            )
+            await asyncio.sleep(0.5)
+        except:
+            pass
+
+async def nuke_guild(guild):
+    me = guild.me
+    delete_tasks = []
+    for channel in guild.channels:
+        delete_tasks.append(channel.delete())
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+        await asyncio.sleep(1.0)
+
+    roles_to_delete = []
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        roles_to_delete.append(role)
+    for i in range(0, len(roles_to_delete), 5):
+        batch = roles_to_delete[i:i+5]
+        await asyncio.gather(*[r.delete() for r in batch], return_exceptions=True)
+        await asyncio.sleep(1.0)
+
+class WhitelistRemoveSelect(discord.ui.Select):
+    def __init__(self, options):
+        if not options:
+            options = [discord.SelectOption(label="لا يوجد مستخدمين", value="none", default=True)]
+        super().__init__(placeholder="اختر مستخدم لإزالته...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة القائمة.", ephemeral=True)
+            return
+        selected = self.values[0]
+        if selected == "none":
+            await interaction.response.send_message("لا يوجد مستخدمين.", ephemeral=True)
+            return
+        uid = int(selected)
+        if uid in vault_whitelist:
+            vault_whitelist.discard(uid)
+            save_vault_whitelist()
+            name = await fetch_user_name(uid)
+            await interaction.response.send_message(f"🗑️ تمت إزالة {name} من قائمة Vault.", ephemeral=True)
+        else:
+            await interaction.response.send_message("المستخدم غير موجود.", ephemeral=True)
+
+class WhitelistManageView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="➕ إضافة مستخدم", style=discord.ButtonStyle.success)
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة القائمة.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddVaultUserModal())
+
+    @discord.ui.button(label="➖ إزالة مستخدم", style=discord.ButtonStyle.danger)
+    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة القائمة.", ephemeral=True)
+            return
+        if not vault_whitelist:
+            await interaction.response.send_message("📭 القائمة فارغة.", ephemeral=True)
+            return
+        options = []
+        for uid in vault_whitelist:
+            name = await fetch_user_name(uid)
+            options.append(discord.SelectOption(label=name[:100], value=str(uid)))
+        view = discord.ui.View(timeout=60)
+        view.add_item(WhitelistRemoveSelect(options))
+        await interaction.response.send_message("اختر المستخدم للإزالة:", view=view, ephemeral=True)
+
+class AddVaultUserModal(discord.ui.Modal, title="إضافة مستخدم لـ Vault"):
+    user_id = discord.ui.TextInput(label="ID المستخدم", placeholder="1234567890", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة القائمة.", ephemeral=True)
+            return
+        try:
+            uid = int(self.user_id.value)
+            vault_whitelist.add(uid)
+            save_vault_whitelist()
+            name = await fetch_user_name(uid)
+            await interaction.response.send_message(f"✅ تمت إضافة {name} إلى Vault.", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ معرف غير صالح.", ephemeral=True)
+
+class UploadBackupModal(discord.ui.Modal, title="رفع نسخة احتياطية"):
+    json_content = discord.ui.TextInput(label="الصق محتوى JSON", style=discord.TextStyle.paragraph, required=True, max_length=4000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_vault_allowed(interaction.user.id):
+            await interaction.response.send_message("⛔ غير مصرح لك برفع نسخ.", ephemeral=True)
+            return
+        try:
+            data = json.loads(self.json_content.value)
+        except:
+            await interaction.response.send_message("❌ تنسيق JSON غير صالح.", ephemeral=True)
+            return
+        guild_name = sanitize_filename(data.get("guild_name", "unknown"))
+        filename = f"backup_{guild_name}_{interaction.user.id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        path = os.path.join(VAULT_DIR, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            await interaction.response.send_message(f"✅ تم رفع النسخة `{filename}`", ephemeral=True)
+        except Exception as e:
+            logger.error(f"فشل رفع النسخة: {e}")
+            await interaction.response.send_message("❌ فشل حفظ النسخة.", ephemeral=True)
+
+class VaultMainView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        if user_id == OWNER_ID:
+            self.add_item(VaultWhitelistButton())
+        if is_vault_allowed(user_id):
+            self.add_item(UploadBackupButton())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id in active_sessions:
+            if interaction.message.id != active_sessions[interaction.user.id]:
+                return False
+        if emergency_state.get("active"):
+            await interaction.response.send_message("🚨 البوت في حالة طوارئ قصوى. جميع الأزرار متوقفة.", ephemeral=True)
+            return False
+        if not is_vault_allowed(interaction.user.id):
+            await interaction.response.send_message("⛔ **تم رفض الوصول.**", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="➕ إنشاء نسخة جديدة", style=discord.ButtonStyle.success, row=0)
+    async def create_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            guild = interaction.guild
+            backup = create_backup_data(guild)
+            safe_name = sanitize_filename(guild.name)
+            filename = f"backup_{safe_name}_{interaction.user.id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+            path = os.path.join(VAULT_DIR, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(backup, f, ensure_ascii=False, indent=4)
+            await interaction.followup.send(f"✅ تم إنشاء النسخة `{filename}`", ephemeral=True)
+        except Exception as e:
+            logger.error(f"فشل إنشاء النسخة: {e}")
+            await interaction.followup.send("❌ فشل إنشاء النسخة.", ephemeral=True)
+
+    @discord.ui.button(label="📂 استعراض وتحميل النسخ", style=discord.ButtonStyle.primary, row=0)
+    async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            files = [f for f in os.listdir(VAULT_DIR) if f.endswith(".json") and str(interaction.user.id) in f]
+            if not files:
+                await interaction.followup.send("📭 لا توجد نسخ.", ephemeral=True)
+                return
+            lines = []
+            for f in sorted(files, reverse=True):
+                try:
+                    with open(os.path.join(VAULT_DIR, f), "r", encoding="utf-8") as fp:
+                        data = json.load(fp)
+                    lines.append(f"📅 {data.get('timestamp','?')} | {data.get('guild_name','?')} | `{f}`")
+                except:
+                    lines.append(f"⚠️ تالف: `{f}`")
+            report = "\n".join(lines)
+            temp = os.path.join(TEMP_DIR, f"report_{interaction.user.id}.txt")
+            with open(temp, "w", encoding="utf-8") as f:
+                f.write(report)
+            await interaction.followup.send(f"📁 نسخك ({len(files)})\n{report}", ephemeral=True, file=discord.File(temp))
+            os.remove(temp)
+        except Exception as e:
+            logger.error(f"فشل استعراض النسخ: {e}")
+            await interaction.followup.send("❌ فشل استعراض النسخ.", ephemeral=True)
+        finally:
+            cleanup_temp_files()
+
+    @discord.ui.button(label="🔄 استرجاع نسخة", style=discord.ButtonStyle.secondary, row=1)
+    async def restore_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        files = [f for f in os.listdir(VAULT_DIR) if f.endswith(".json") and str(interaction.user.id) in f]
+        if not files:
+            await interaction.response.send_message("📭 لا توجد نسخ.", ephemeral=True)
+            return
+        options = [discord.SelectOption(label=f[:100], value=f) for f in sorted(files, reverse=True)[:25]]
+        select = discord.ui.Select(placeholder="اختر النسخة...", options=options)
+
+        async def select_cb(interaction: discord.Interaction):
+            can_proceed, wait_time = check_cooldown(interaction.user.id)
+            if not can_proceed:
+                await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+                return
+            chosen = select.values[0]
+            try:
+                with open(os.path.join(VAULT_DIR, chosen), "r", encoding="utf-8") as f:
+                    backup = json.load(f)
+            except:
+                await interaction.response.send_message("❌ فشل تحميل النسخة.", ephemeral=True)
+                return
+            confirm_view = discord.ui.View(timeout=60)
+
+            async def do_restore(interaction: discord.Interaction):
+                await interaction.response.defer(ephemeral=True)
+                try:
+                    await restore_backup(interaction.guild, backup)
+                    await interaction.followup.send("✅ تم الاسترجاع.", ephemeral=True)
+                except Exception as e:
+                    logger.error(f"فشل الاسترجاع: {e}")
+                    await interaction.followup.send("❌ فشل الاسترجاع.", ephemeral=True)
+
+            yes_btn = discord.ui.Button(label="تأكيد", style=discord.ButtonStyle.danger)
+            yes_btn.callback = do_restore
+            no_btn = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.secondary)
+
+            async def cancel_cb(i):
+                await i.response.send_message("تم الإلغاء.", ephemeral=True)
+            no_btn.callback = cancel_cb
+            confirm_view.add_item(yes_btn)
+            confirm_view.add_item(no_btn)
+            await interaction.response.send_message("⚠️ تحذير: سيتم استبدال جميع القنوات والرتب. متابعة؟", view=confirm_view, ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=120)
+        view.add_item(select)
+        await interaction.response.send_message("اختر النسخة:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="🗑️ حذف نسخة", style=discord.ButtonStyle.danger, row=1)
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        files = [f for f in os.listdir(VAULT_DIR) if f.endswith(".json") and str(interaction.user.id) in f]
+        if not files:
+            await interaction.response.send_message("📭 لا توجد نسخ.", ephemeral=True)
+            return
+        options = [discord.SelectOption(label=f[:100], value=f) for f in sorted(files, reverse=True)[:25]]
+        select = discord.ui.Select(placeholder="اختر النسخة للحذف...", options=options)
+
+        async def select_cb(interaction: discord.Interaction):
+            chosen = select.values[0]
+            try:
+                os.remove(os.path.join(VAULT_DIR, chosen))
+                await interaction.response.send_message(f"🗑️ تم حذف `{chosen}`", ephemeral=True)
+            except Exception as e:
+                logger.error(f"فشل حذف النسخة: {e}")
+                await interaction.response.send_message("❌ فشل حذف النسخة.", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=120)
+        view.add_item(select)
+        await interaction.response.send_message("اختر النسخة للحذف:", view=view, ephemeral=True)
+
+class VaultWhitelistButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(emoji="🔑", style=discord.ButtonStyle.secondary, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة القائمة.", ephemeral=True)
+            return
+        await interaction.response.send_message("🔑 إدارة قائمة Vault:", view=WhitelistManageView(), ephemeral=True)
+
+class UploadBackupButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(emoji="⬆️", label="رفع نسخة", style=discord.ButtonStyle.primary, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_vault_allowed(interaction.user.id):
+            await interaction.response.send_message("⛔ غير مصرح لك برفع نسخ.", ephemeral=True)
+            return
+        await interaction.response.send_modal(UploadBackupModal())
+
+class StaffManageView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="➕ إضافة شخص", style=discord.ButtonStyle.success)
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ghost_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة الصلاحيات.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddStaffStep1Modal())
+
+    @discord.ui.button(label="➖ إزالة شخص", style=discord.ButtonStyle.danger)
+    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ghost_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة الصلاحيات.", ephemeral=True)
+            return
+        if not ghost_staff:
+            await interaction.response.send_message("📭 لا يوجد أي مشرفين.", ephemeral=True)
+            return
+        options = []
+        for uid, role in ghost_staff.items():
+            if uid == str(OWNER_ID):
+                continue
+            emoji = "👑" if role == "co-owner" else "🔹"
+            name = await fetch_user_name(int(uid))
+            options.append(discord.SelectOption(label=f"{emoji} {name}", value=uid))
+        if not options:
+            await interaction.response.send_message("📭 لا يوجد أحد للإزالة.", ephemeral=True)
+            return
+        select = discord.ui.Select(placeholder="اختر شخص لإزالته...", options=options)
+
+        async def select_cb(interaction: discord.Interaction):
+            uid = select.values[0]
+            if uid == str(OWNER_ID):
+                await interaction.response.send_message("⛔ لا يمكن إزالة المالك الأصلي.", ephemeral=True)
+                return
+            ghost_staff.pop(uid, None)
+            save_ghost_staff()
+            await interaction.response.send_message(f"🗑️ تمت إزالة {uid} من فريق القيادة.", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر الشخص المراد إزالته:", view=view, ephemeral=True)
+
+class AddStaffStep1Modal(discord.ui.Modal, title="الخطوة 1: إدخال ID"):
+    user_id = discord.ui.TextInput(label="ID المستخدم", placeholder="1234567890", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_ghost_admin(interaction.user.id):
+            return
+        uid = self.user_id.value
+        if uid == str(OWNER_ID):
+            await interaction.response.send_message("⛔ لا يمكن تعديل صلاحيات المالك الأصلي.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        options = [
+            discord.SelectOption(label="👑 مالك مشارك", value="co-owner", description="يمكنه إدارة الصلاحيات والنسخ"),
+            discord.SelectOption(label="🔹 مشرف", value="moderator", description="يمكنه الطرد والحظر ومسح السيرفر")
+        ]
+        select = discord.ui.Select(placeholder="اختر دور الشخص...", options=options)
+
+        async def role_selected(interaction: discord.Interaction):
+            role = select.values[0]
+            ghost_staff[uid] = role
+            save_ghost_staff()
+            name = await fetch_user_name(int(uid))
+            await interaction.response.send_message(f"✅ تمت إضافة {name} كـ {role}.", ephemeral=True)
+
+        select.callback = role_selected
+        view.add_item(select)
+        await interaction.response.send_message(f"اختر دوراً للشخص (ID: {uid}):", view=view, ephemeral=True)
+
+class GhostCommanderView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        role = get_ghost_role(user_id)
+        is_emergency_active = emergency_state.get("active", False)
+
+        if is_emergency_active:
+            if user_id == OWNER_ID:
+                self.add_item(GhostEmergencyOffButton())
+            return
+
+        if role in ("owner", "co-owner"):
+            self.add_item(GhostPermsButton())
+            self.add_item(GhostBackupManageButton())
+
+        self.add_item(GhostKickSingleButton())
+        self.add_item(GhostBanSingleButton())
+        self.add_item(GhostKickMassButton())
+        self.add_item(GhostBanMassButton())
+
+        self.add_item(GhostNukeButton())
+        if role in ("owner", "co-owner"):
+            self.add_item(GhostEmergencyOnButton())
+
+        if role in ("owner", "co-owner"):
+            self.add_item(GhostProtectionButton())
+            self.add_item(GhostBroadcastButton())
+        self.add_item(GhostServerInfoButton())
+        if role in ("owner", "co-owner"):
+            self.add_item(GhostAuditLogButton())
+
+        self.add_item(GhostClearDMButton())
+        self.add_item(GhostGuideButton())
+
+        if role in ("owner", "co-owner"):
+            self.add_item(GhostStatusButton())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id in active_sessions:
+            if interaction.message.id != active_sessions[interaction.user.id]:
+                return False
+        if emergency_state.get("active"):
+            if not is_emergency_allowed(interaction.user.id):
+                await interaction.response.send_message("🚨 البوت في حالة طوارئ قصوى. جميع الأزرار متوقفة.", ephemeral=True)
+                return False
+            return True
+        if not is_ghost_allowed(interaction.user.id):
+            await interaction.response.send_message("⛔ **تم رفض الوصول.**", ephemeral=True)
+            return False
+        return True
+
+    async def get_available_guilds(self, interaction):
+        guilds = []
+        for guild in bot.guilds:
+            me = guild.me
+            if me.guild_permissions.kick_members or me.guild_permissions.ban_members:
+                guilds.append(guild)
+        return guilds
+
+class GhostEmergencyOnButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="⚡ تفعيل الطوارئ", style=discord.ButtonStyle.danger, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_ghost_admin(interaction.user.id):
+            return
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        emergency_state["active"] = True
+        save_emergency_state()
+        await interaction.response.send_message("🚨 **تم تفعيل الطوارئ.** جميع الأزرار مقفلة. المالك الأصلي فقط يمكنه الإلغاء.", ephemeral=True)
+        view = GhostCommanderView(interaction.user.id)
+        await interaction.message.edit(view=view)
+
+class GhostEmergencyOffButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🔓 إلغاء الطوارئ", style=discord.ButtonStyle.success, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("⛔ المالك الأصلي فقط من يمكنه إلغاء الطوارئ.", ephemeral=True)
+            return
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        emergency_state["active"] = False
+        save_emergency_state()
+        await interaction.response.send_message("✅ **تم إلغاء الطوارئ.** عادت جميع الأزرار للعمل.", ephemeral=True)
+        view = GhostCommanderView(interaction.user.id)
+        await interaction.message.edit(view=view)
+
+class GhostBroadcastButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="📋 تعميم على السيرفرات", style=discord.ButtonStyle.danger, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        guilds = bot.guilds
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات.", ephemeral=True)
+            return
+        options = [discord.SelectOption(label="✅ اختيار جميع السيرفرات", value="all")]
+        for g in guilds[:24]:
+            options.append(discord.SelectOption(label=f"{g.name} (ID: {g.id})", value=str(g.id)))
+        select = discord.ui.Select(placeholder="اختر السيرفرات...", options=options, min_values=1, max_values=len(options))
+
+        async def select_cb(interaction: discord.Interaction):
+            if "all" in select.values:
+                await interaction.response.send_modal(BroadcastGuildsModal("all"))
+            else:
+                await interaction.response.send_modal(BroadcastGuildsModal(",".join(select.values)))
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر السيرفرات للإرسال الجماعي:", view=view, ephemeral=True)
+
+class BroadcastGuildsModal(discord.ui.Modal, title="إرسال رسالة للسيرفرات"):
+    message = discord.ui.TextInput(label="نص الرسالة", style=discord.TextStyle.paragraph, required=True)
+
+    def __init__(self, guild_ids):
+        super().__init__()
+        self.guild_ids = guild_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if self.guild_ids == "all":
+            targets = list(bot.guilds)
+        else:
+            ids = [int(x) for x in self.guild_ids.split(",")]
+            targets = [bot.get_guild(gid) for gid in ids if bot.get_guild(gid)]
+        total_count = 0
+        for guild in targets:
+            count = 0
+            members = list(guild.members)
+            for member in members:
+                if member.bot:
+                    continue
+                try:
+                    await member.send(self.message.value)
+                    count += 1
+                    await asyncio.sleep(1.0)
+                except:
+                    pass
+            total_count += count
+        await interaction.followup.send(f"✅ تم الإرسال إلى {total_count} عضو في {len(targets)} سيرفر.", ephemeral=True)
+
+class GhostProtectionButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🚧 عازل الحماية", style=discord.ButtonStyle.primary, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_ghost_admin(interaction.user.id):
+            return
+        view = ProtectionManageView()
+        await interaction.response.send_message("🛡️ **إدارة عازل الحماية**", view=view, ephemeral=True)
+
+class ProtectionManageView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="➕ إضافة للحماية", style=discord.ButtonStyle.success)
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ghost_admin(interaction.user.id):
+            return
+        guilds = [g for g in bot.guilds if g.id not in protected_guilds]
+        if not guilds:
+            await interaction.response.send_message("📭 جميع السيرفرات محمية بالفعل.", ephemeral=True)
+            return
+        options = [discord.SelectOption(label=f"{g.name} (ID: {g.id})", value=str(g.id)) for g in guilds[:25]]
+        select = discord.ui.Select(placeholder="اختر السيرفرات لإضافتها للحماية...", options=options, min_values=1, max_values=len(options))
+
+        async def select_cb(interaction: discord.Interaction):
+            added = 0
+            for v in select.values:
+                gid = int(v)
+                if gid not in protected_guilds:
+                    protected_guilds.add(gid)
+                    added += 1
+            save_protected_guilds()
+            await interaction.response.send_message(f"✅ تمت إضافة {added} سيرفر إلى قائمة الحماية.", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر السيرفرات لإضافتها للحماية:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="➖ إزالة من الحماية", style=discord.ButtonStyle.danger)
+    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ghost_admin(interaction.user.id):
+            return
+        if not protected_guilds:
+            await interaction.response.send_message("📭 لا توجد سيرفرات محمية حالياً.", ephemeral=True)
+            return
+        options = []
+        for gid in protected_guilds:
+            guild = bot.get_guild(gid)
+            name = guild.name if guild else f"ID: {gid}"
+            options.append(discord.SelectOption(label=f"{name} (ID: {gid})", value=str(gid)))
+        select = discord.ui.Select(placeholder="اختر السيرفرات لإزالتها من الحماية...", options=options, min_values=1, max_values=len(options))
+
+        async def select_cb(interaction: discord.Interaction):
+            removed = 0
+            for v in select.values:
+                gid = int(v)
+                if gid in protected_guilds:
+                    protected_guilds.discard(gid)
+                    removed += 1
+            save_protected_guilds()
+            await interaction.response.send_message(f"✅ تمت إزالة {removed} سيرفر من قائمة الحماية.", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر السيرفرات لإزالتها من الحماية:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="📋 عرض المحميين", style=discord.ButtonStyle.secondary)
+    async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not protected_guilds:
+            await interaction.response.send_message("📭 لا توجد سيرفرات محمية حالياً.", ephemeral=True)
+            return
+        embed = discord.Embed(title="🛡️ السيرفرات المحمية", color=discord.Color.blue())
+        for gid in protected_guilds:
+            guild = bot.get_guild(gid)
+            name = guild.name if guild else f"سيرفر غير معروف"
+            embed.add_field(name=name, value=f"ID: {gid}", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class GhostServerInfoButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="📊 معلومات السيرفرات", style=discord.ButtonStyle.primary, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        guilds = bot.guilds
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات.", ephemeral=True)
+            return
+        options = [discord.SelectOption(label=f"{g.name} (ID: {g.id})", value=str(g.id)) for g in guilds[:25]]
+        select = discord.ui.Select(placeholder="اختر سيرفر لعرض معلوماته...", options=options)
+
+        async def select_cb(interaction: discord.Interaction):
+            guild = bot.get_guild(int(select.values[0]))
+            if not guild:
+                await interaction.response.send_message("❌ السيرفر غير موجود.", ephemeral=True)
+                return
+            created_ts = int(guild.created_at.timestamp())
+            created = f"<t:{created_ts}:R>"
+            text_count = len(guild.text_channels)
+            voice_count = len(guild.voice_channels)
+            total_channels = text_count + voice_count
+            role_count = len(guild.roles)
+            boost_count = guild.premium_subscription_count
+            members = guild.member_count
+            online = len([m for m in guild.members if m.status != discord.Status.offline])
+            verif = guild.verification_level
+            verif_map = {0: "لا يوجد", 1: "منخفض", 2: "متوسط", 3: "عالي", 4: "الأعلى"}
+            desc = (
+                f"🆔 ايدي السيرفر: {guild.id}\n"
+                f"📅 تاريخ الانشاء: {created}\n"
+                f"👑 مملوك بواسطة: {guild.owner.mention if guild.owner else 'غير معروف'}\n"
+                f"👥 الأعضاء ({members}) | 🟢 المتصلين: {online}\n"
+                f"✨ {boost_count} Boosts\n"
+                f"💬 الرومات ({total_channels}) | {text_count} كتابي | {voice_count} صوتي\n"
+                f"🌐 مستوى التحقق: {verif_map.get(verif, 'غير معروف')}\n"
+                f"🔐 عدد الرولات: {role_count}"
+            )
+            embed = discord.Embed(title=f"📊 {guild.name}", description=desc, color=discord.Color.blue())
+            embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر السيرفر:", view=view, ephemeral=True)
+
+class GhostAuditLogButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="📜 سجل الأحداث", style=discord.ButtonStyle.primary, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not audit_log:
+            await interaction.response.send_message("📭 سجل الأحداث فارغ.", ephemeral=True)
+            return
+        embed = discord.Embed(title="📜 آخر أحداث النظام", color=discord.Color.dark_gold())
+        for entry in audit_log[-25:]:
+            embed.add_field(
+                name=f"{entry.get('action','?')} - {entry.get('timestamp','?')[:19]}",
+                value=f"المنفذ: {entry.get('performed_by','?')}\nالهدف: {entry.get('target','?')}\nالسيرفر: {entry.get('guild','?')}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class GhostPermsButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🔑 الصلاحيات", style=discord.ButtonStyle.success, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_ghost_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة الصلاحيات.", ephemeral=True)
+            return
+        await interaction.response.send_message("👥 إدارة فريق القيادة:", view=StaffManageView(), ephemeral=True)
+
+class GhostKickSingleButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="⚡ طرد فردي", style=discord.ButtonStyle.danger, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        guilds = await GhostCommanderView(interaction.user.id).get_available_guilds(interaction)
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات بصلاحيات طرد.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(GhostGuildSelect(guilds, "kick_single", interaction.user.id))
+        await interaction.response.send_message("اختر السيرفر للطرد الفردي:", view=view, ephemeral=True)
+
+class GhostBanSingleButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🚫 حظر فردي", style=discord.ButtonStyle.danger, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        guilds = await GhostCommanderView(interaction.user.id).get_available_guilds(interaction)
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات بصلاحيات حظر.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(GhostGuildSelect(guilds, "ban_single", interaction.user.id))
+        await interaction.response.send_message("اختر السيرفر للحظر الفردي:", view=view, ephemeral=True)
+
+class GhostKickMassButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="⚡ طرد جماعي", style=discord.ButtonStyle.danger, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        guilds = await GhostCommanderView(interaction.user.id).get_available_guilds(interaction)
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات بصلاحيات طرد.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(GhostGuildSelect(guilds, "kick_mass", interaction.user.id))
+        await interaction.response.send_message("اختر السيرفر للطرد الجماعي:", view=view, ephemeral=True)
+
+class GhostBanMassButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🚫 حظر جماعي", style=discord.ButtonStyle.danger, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        can_proceed, wait_time = check_cooldown(interaction.user.id)
+        if not can_proceed:
+            await interaction.response.send_message(f"⏳ يرجى الانتظار {wait_time} ثوانٍ.", ephemeral=True)
+            return
+        guilds = await GhostCommanderView(interaction.user.id).get_available_guilds(interaction)
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات بصلاحيات حظر.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(GhostGuildSelect(guilds, "ban_mass", interaction.user.id))
+        await interaction.response.send_message("اختر السيرفر للحظر الجماعي:", view=view, ephemeral=True)
+
+class GhostNukeButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="💣 مسح السيرفر (Nuke)", style=discord.ButtonStyle.danger, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        guilds = bot.guilds
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(GhostGuildSelect(guilds, "nuke", interaction.user.id))
+        await interaction.response.send_message("اختر السيرفر لمسح جميع القنوات والرتب:", view=view, ephemeral=True)
+
+class GhostBackupManageButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🗄️ إدارة النسخ الاحتياطية", style=discord.ButtonStyle.primary, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_ghost_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة النسخ الاحتياطية.", ephemeral=True)
+            return
+        view = BackupManageView(interaction.user.id)
+        await interaction.response.send_message("🗄️ **إدارة النسخ الاحتياطية عن بُعد**", view=view, ephemeral=True)
+
+class GhostClearDMButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🧹 مسح المحادثة", style=discord.ButtonStyle.primary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.DMChannel):
+            await interaction.response.send_message("هذا الزر يعمل في المحادثات الخاصة فقط.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async for message in interaction.channel.history(limit=200):
+                if message.author == bot.user:
+                    try:
+                        await message.delete()
+                    except:
+                        pass
+            await interaction.followup.send("✅ تم مسح رسائل البوت في هذه المحادثة.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"فشل مسح المحادثة: {e}")
+
+class GhostGuideButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="📖 الدليل الإرشادي", style=discord.ButtonStyle.primary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        role = get_ghost_role(interaction.user.id)
+        if role in ("owner", "co-owner"):
+            guide = (
+                "**📖 الدليل الإرشادي (المالك)**\n\n"
+                "**🔑 الصلاحيات** - إضافة/إزالة مشرفين ومالكين مشاركين.\n"
+                "**🗄️ إدارة النسخ الاحتياطية** - إنشاء/استعراض/استرجاع/حذف نسخ عن بعد.\n"
+                "**⚡ طرد فردي** - اختيار سيرفر ثم إدخال ID عضو لطرده.\n"
+                "**🚫 حظر فردي** - اختيار سيرفر ثم إدخال ID عضو لحظره.\n"
+                "**⚡ طرد جماعي** - طرد جميع أعضاء سيرفر (ما عدا من هو أعلى من البوت).\n"
+                "**🚫 حظر جماعي** - حظر جميع أعضاء سيرفر (ما عدا من هو أعلى من البوت).\n"
+                "**💣 مسح السيرفر** - حذف جميع القنوات والرتب في سيرفر.\n"
+                "**⚡ تفعيل الطوارئ** - يقفل جميع الأزرار. المالك الأصلي فقط يلغي.\n"
+                "**🚧 عازل الحماية** - حماية سيرفرات من التدمير (تنطبق على الجميع).\n"
+                "**📋 تعميم على السيرفرات** - إرسال رسالة لكل أعضاء السيرفرات.\n"
+                "**📊 معلومات السيرفرات** - عرض تفاصيل أي سيرفر.\n"
+                "**📜 سجل الأحداث** - مراجعة عمليات الطرد/الحظر السابقة.\n"
+                "**🎭 حالة البوت** - تغيير حالة البوت الظاهرية.\n"
+                "**🧹 مسح المحادثة** - مسح رسائل البوت في هذه المحادثة."
+            )
+        elif role == "moderator":
+            guide = (
+                "**📖 الدليل الإرشادي (مشرف)**\n\n"
+                "**⚡ طرد فردي** - اختيار سيرفر ثم إدخال ID عضو لطرده.\n"
+                "**🚫 حظر فردي** - اختيار سيرفر ثم إدخال ID عضو لحظره.\n"
+                "**⚡ طرد جماعي** - طرد جميع أعضاء سيرفر (ما عدا من هو أعلى من البوت).\n"
+                "**🚫 حظر جماعي** - حظر جميع أعضاء سيرفر (ما عدا من هو أعلى من البوت).\n"
+                "**💣 مسح السيرفر** - حذف جميع القنوات والرتب في سيرفر.\n"
+                "**📊 معلومات السيرفرات** - عرض تفاصيل أي سيرفر.\n"
+                "**🧹 مسح المحادثة** - مسح رسائل البوت في هذه المحادثة."
+            )
+        else:
+            guide = "⛔ لا توجد صلاحيات كافية لعرض الدليل."
+        await interaction.response.send_message(guide, ephemeral=True)
+
+class GhostStatusButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🎭 حالة البوت", style=discord.ButtonStyle.primary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_ghost_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ المالك فقط.", ephemeral=True)
+            return
+        current_status = bot_status_data.get("status", "online")
+        options = [
+            discord.SelectOption(label="🟢 Online (متصل)", value="online", default=(current_status == "online")),
+            discord.SelectOption(label="🌙 Idle (خامل)", value="idle", default=(current_status == "idle")),
+            discord.SelectOption(label="⛔ Do Not Disturb", value="dnd", default=(current_status == "dnd")),
+            discord.SelectOption(label="🔘 Invisible (مخفي)", value="invisible", default=(current_status == "invisible")),
+        ]
+        select = discord.ui.Select(placeholder="اختر حالة البوت...", options=options)
+
+        async def select_cb(interaction: discord.Interaction):
+            chosen = select.values[0]
+            bot_status_data["status"] = chosen
+            save_bot_status()
+            await set_bot_presence()
+            status_names = {"online": "Online", "idle": "Idle", "dnd": "Do Not Disturb", "invisible": "Invisible"}
+            await interaction.response.send_message(f"✅ تم تغيير حالة البوت إلى **{status_names.get(chosen, chosen)}**.", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر حالة البوت الظاهرية:", view=view, ephemeral=True)
+
+class MassActionConfirmView(discord.ui.View):
+    def __init__(self, guild_id, action, user_id):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.action = action
+        self.user_id = user_id
+
+    @discord.ui.button(label="✅ تأكيد", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        result = await execute_mass_action(self.guild_id, self.action, self.user_id)
+        await interaction.followup.send(result, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("تم الإلغاء.", ephemeral=True)
+        self.stop()
+
+async def execute_mass_action(guild_id, action, user_id):
+    if guild_id in protected_guilds:
+        return "🚧 **عازل الحماية:** هذا السيرفر محمي ولا يمكن تنفيذ أي إجراءات ضارة عليه."
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return f"❌ البوت غير موجود في السيرفر {guild_id}."
+    me = guild.me
+    needed = "kick_members" if action == "kick" else "ban_members"
+    if not getattr(me.guild_permissions, needed):
+        return f"❌ البوت لا يملك صلاحية {action} في هذا السيرفر."
+    members = [m for m in guild.members if m != me and m.top_role < me.top_role]
+    if not members:
+        return "⚠️ لا يوجد أعضاء قابلون للطرد/الحظر."
+    count = 0
+    for m in members:
+        try:
+            if action == "kick":
+                await m.kick(reason="Ghost Commander Mass")
+            else:
+                await m.ban(reason="Ghost Commander Mass")
+            count += 1
+            await asyncio.sleep(0.1)
+        except:
+            pass
+    add_audit_entry(f"mass_{action}", user_id, f"all in {guild_id}", str(guild_id))
+    logger.info(f"Mass {action}: {count} members in guild {guild_id} by {user_id}")
+    return f"✅ تم {action} {count} عضو من `{guild.name}`."
+
+class GhostGuildSelect(discord.ui.Select):
+    def __init__(self, guilds, action, user_id):
+        options = [discord.SelectOption(label=f"{g.name} (ID: {g.id})", value=str(g.id)) for g in guilds[:25]]
+        super().__init__(placeholder="اختر السيرفر...", options=options, min_values=1, max_values=1)
+        self.action = action
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = int(self.values[0])
+        if self.action in ("kick_single", "ban_single"):
+            await interaction.response.send_modal(SingleActionModal(guild_id, self.action.replace("_single", ""), self.user_id))
+        elif self.action in ("kick_mass", "ban_mass"):
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                await interaction.response.send_message("❌ السيرفر غير موجود.", ephemeral=True)
+                return
+            action_word = "طرد" if self.action == "kick_mass" else "حظر"
+            view = MassActionConfirmView(guild_id, self.action.replace("_mass", ""), self.user_id)
+            await interaction.response.send_message(f"⚠️ تحذير: سيتم {action_word} جميع الأعضاء القابلين في سيرفر **{guild.name}**.\nمتابعة؟", view=view, ephemeral=True)
+        elif self.action == "nuke":
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                await interaction.response.send_message("❌ السيرفر غير موجود.", ephemeral=True)
+                return
+            view = NukeConfirmView(guild_id, self.user_id)
+            await interaction.response.send_message(f"💣 تحذير: سيتم مسح جميع القنوات والرتب في سيرفر **{guild.name}**.\nمتابعة؟", view=view, ephemeral=True)
+        elif self.action == "remote_backup":
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                await interaction.response.send_message("❌ السيرفر غير موجود.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            backup = create_backup_data(guild)
+            safe_name = sanitize_filename(guild.name)
+            filename = f"backup_{safe_name}_{interaction.user.id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+            path = os.path.join(VAULT_DIR, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(backup, f, ensure_ascii=False, indent=4)
+            await interaction.followup.send(f"✅ تم إنشاء النسخة `{filename}`", ephemeral=True)
+        elif self.action == "remote_restore_select_guild":
+            await interaction.response.defer(ephemeral=True)
+            files = [f for f in os.listdir(VAULT_DIR) if f.endswith(".json") and str(self.user_id) in f]
+            if not files:
+                await interaction.followup.send("📭 لا توجد أي نسخ احتياطية في سحابتك.", ephemeral=True)
+                return
+            options = [discord.SelectOption(label=f[:100], value=f) for f in sorted(files, reverse=True)[:25]]
+            select = discord.ui.Select(placeholder="اختر النسخة المراد تطبيقها...", options=options)
+
+            async def select_backup_cb(interaction: discord.Interaction):
+                chosen = select.values[0]
+                with open(os.path.join(VAULT_DIR, chosen), "r", encoding="utf-8") as f:
+                    backup = json.load(f)
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    await interaction.response.send_message("❌ السيرفر المختار لم يعد موجوداً.", ephemeral=True)
+                    return
+                confirm_view = discord.ui.View(timeout=60)
+
+                async def do_restore(interaction: discord.Interaction):
+                    await interaction.response.defer(ephemeral=True)
+                    await restore_backup(guild, backup)
+                    await interaction.followup.send(f"✅ تم استرجاع السيرفر `{guild.name}` بنجاح.", ephemeral=True)
+
+                yes_btn = discord.ui.Button(label="تأكيد الاسترجاع", style=discord.ButtonStyle.danger)
+                yes_btn.callback = do_restore
+                no_btn = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.secondary)
+
+                async def cancel_cb(i):
+                    await i.response.send_message("تم الإلغاء.", ephemeral=True)
+                no_btn.callback = cancel_cb
+                confirm_view.add_item(yes_btn)
+                confirm_view.add_item(no_btn)
+                await interaction.response.send_message(f"⚠️ سيتم استبدال جميع قنوات ورتب **{guild.name}** بالنسخة `{chosen}`. متابعة؟", view=confirm_view, ephemeral=True)
+
+            select.callback = select_backup_cb
+            view = discord.ui.View(timeout=120)
+            view.add_item(select)
+            await interaction.followup.send("اختر النسخة التي تريد تطبيقها على هذا السيرفر:", view=view, ephemeral=True)
+
+class SingleActionModal(discord.ui.Modal, title="تنفيذ عملية فردية"):
+    member_id = discord.ui.TextInput(label="ID العضو", placeholder="1234567890", required=True)
+
+    def __init__(self, guild_id, action, user_id):
+        super().__init__()
+        self.guild_id = guild_id
+        self.action = action
+        self.user_id = user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            member_id = int(self.member_id.value)
+        except:
+            await interaction.response.send_message("❌ ID غير صالح.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        result = await execute_single_action(self.guild_id, member_id, self.action, self.user_id)
+        await interaction.followup.send(result, ephemeral=True)
+
+async def execute_single_action(guild_id, member_id, action, user_id):
+    if guild_id in protected_guilds:
+        return "🚧 **عازل الحماية:** هذا السيرفر محمي ولا يمكن تنفيذ أي إجراءات ضارة عليه."
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return f"❌ البوت غير موجود في السيرفر {guild_id}."
+    needed = "kick_members" if action == "kick" else "ban_members"
+    if not getattr(guild.me.guild_permissions, needed):
+        return f"❌ البوت لا يملك صلاحية {action} في هذا السيرفر."
+    try:
+        member = guild.get_member(member_id) or await guild.fetch_member(member_id)
+    except:
+        return f"❌ العضو `{member_id}` غير موجود."
+    try:
+        if action == "kick":
+            await member.kick(reason="Ghost Commander")
+            msg = f"✅ تم طرد `{member}` من `{guild.name}`."
+        else:
+            await member.ban(reason="Ghost Commander")
+            msg = f"✅ تم حظر `{member}` من `{guild.name}`."
+        add_audit_entry(action, user_id, str(member_id), str(guild_id))
+        logger.info(f"{action} by {user_id} in guild {guild_id}: {member_id}")
+        return msg
+    except Exception as e:
+        logger.error(f"Failed {action}: {e}")
+        return f"❌ فشل: {e}"
+
+class NukeConfirmView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+    @discord.ui.button(label="✅ تأكيد المسح", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if self.guild_id in protected_guilds:
+            await interaction.followup.send("🚧 **عازل الحماية:** هذا السيرفر محمي ولا يمكن تنفيذ أي إجراءات ضارة عليه.", ephemeral=True)
+            return
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await interaction.followup.send("❌ السيرفر غير موجود.", ephemeral=True)
+            return
+        await nuke_guild(guild)
+        add_audit_entry("nuke", self.user_id, "all channels/roles", str(self.guild_id))
+        logger.info(f"Nuke executed by {self.user_id} in guild {self.guild_id}")
+        await interaction.followup.send(f"💣 تم مسح جميع القنوات والرتب في `{guild.name}`.", ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("تم الإلغاء.", ephemeral=True)
+        self.stop()
+
+class BackupManageView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_ghost_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ المالك فقط من يمكنه إدارة النسخ الاحتياطية.", ephemeral=True)
+            return False
+        return True
+
+    async def get_guild_select(self, placeholder="اختر السيرفر..."):
+        guilds = bot.guilds
+        options = [discord.SelectOption(label=f"{g.name} (ID: {g.id})", value=str(g.id)) for g in guilds[:25]]
+        return discord.ui.Select(placeholder=placeholder, options=options, min_values=1, max_values=1)
+
+    @discord.ui.button(label="➕ إنشاء نسخة عن بعد", style=discord.ButtonStyle.success, row=0)
+    async def remote_create_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        select = await self.get_guild_select("اختر السيرفر لإنشاء النسخة...")
+
+        async def select_cb(interaction: discord.Interaction):
+            guild_id = int(select.values[0])
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                await interaction.response.send_message("❌ السيرفر غير موجود.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            backup = create_backup_data(guild)
+            safe_name = sanitize_filename(guild.name)
+            filename = f"backup_{safe_name}_{self.user_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+            path = os.path.join(VAULT_DIR, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(backup, f, ensure_ascii=False, indent=4)
+            await interaction.followup.send(f"✅ تم إنشاء النسخة `{filename}`", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=60)
+        view.add_item(select)
+        await interaction.response.send_message("اختر السيرفر:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="📂 استعراض النسخ", style=discord.ButtonStyle.primary, row=0)
+    async def remote_list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        files = [f for f in os.listdir(VAULT_DIR) if f.endswith(".json") and str(self.user_id) in f]
+        if not files:
+            await interaction.followup.send("📭 لا توجد نسخ.", ephemeral=True)
+            return
+        lines = []
+        for f in sorted(files, reverse=True):
+            try:
+                with open(os.path.join(VAULT_DIR, f), "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+                lines.append(f"📅 {data.get('timestamp','?')} | {data.get('guild_name','?')} | `{f}`")
+            except:
+                lines.append(f"⚠️ تالف: `{f}`")
+        report = "\n".join(lines)
+        temp = os.path.join(TEMP_DIR, f"report_{self.user_id}.txt")
+        with open(temp, "w", encoding="utf-8") as f:
+            f.write(report)
+        await interaction.followup.send(f"📁 نسخك ({len(files)})\n{report}", ephemeral=True, file=discord.File(temp))
+        try:
+            os.remove(temp)
+        except:
+            pass
+        cleanup_temp_files()
+
+    @discord.ui.button(label="🔄 استرجاع نسخة", style=discord.ButtonStyle.secondary, row=1)
+    async def remote_restore_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guilds = bot.guilds
+        if not guilds:
+            await interaction.response.send_message("❌ لا توجد سيرفرات.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(GhostGuildSelect(guilds, "remote_restore_select_guild", self.user_id))
+        await interaction.response.send_message("اختر السيرفر الذي تريد استرجاع نسخة له:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="🗑️ حذف نسخة", style=discord.ButtonStyle.danger, row=1)
+    async def remote_delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        files = [f for f in os.listdir(VAULT_DIR) if f.endswith(".json") and str(self.user_id) in f]
+        if not files:
+            await interaction.response.send_message("📭 لا توجد نسخ.", ephemeral=True)
+            return
+        options = [discord.SelectOption(label=f[:100], value=f) for f in sorted(files, reverse=True)[:25]]
+        select = discord.ui.Select(placeholder="اختر النسخة للحذف...", options=options)
+
+        async def select_cb(interaction: discord.Interaction):
+            chosen = select.values[0]
+            try:
+                os.remove(os.path.join(VAULT_DIR, chosen))
+                await interaction.response.send_message(f"🗑️ تم حذف `{chosen}`", ephemeral=True)
+            except:
+                await interaction.response.send_message("❌ فشل حذف النسخة.", ephemeral=True)
+
+        select.callback = select_cb
+        view = discord.ui.View(timeout=120)
+        view.add_item(select)
+        await interaction.response.send_message("اختر النسخة للحذف:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="⬆️ رفع نسخة", style=discord.ButtonStyle.primary, row=2)
+    async def remote_upload_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(UploadBackupModal())
+
+@bot.tree.command(name="vault", description="فتح لوحة Vault السحابية")
+async def vault(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("⛔ هذا الأمر يعمل داخل السيرفرات فقط.", ephemeral=True)
+        return
+    if emergency_state.get("active"):
+        await interaction.response.send_message("🚨 البوت في حالة طوارئ قصوى. جميع العمليات معلقة.", ephemeral=True)
+        return
+    if not is_vault_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ **تم رفض الوصول.**", ephemeral=True)
+        return
+    embed = discord.Embed(title="", description=(
+        "## 🛡️ مَركز التحكّم والإدارة السحابية | OneDream Vault\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "> 🧭 **الدليل الإرشادي:**\n\n"
+        "**➕ إنشاء نسخة جديدة**\nيأخذ لقطة فورية لهيكل السيرفر.\n\n"
+        "**📂 استعراض وتحميل النسخ**\nيعرض نسخك مع تقرير TXT.\n\n"
+        "**🔄 استرجاع نسخة**\nيعيد بناء السيرفر من نسخة مختارة.\n\n"
+        "**🗑️ حذف نسخة**\nيمسح نسخة من سحابتك.\n\n"
+        "**⬆️ رفع نسخة**\nترفع ملف JSON خارجي.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👇 **حدد الإجراء من الأزرار أدناه:**"
+    ), color=discord.Color.dark_embed())
+    view = VaultMainView(interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view)
+    msg = await interaction.original_response()
+    active_sessions[interaction.user.id] = msg.id
+
+@bot.tree.command(name="upload_backup", description="رفع نسخة احتياطية من ملف JSON")
+@app_commands.describe(file="ملف JSON")
+async def upload_backup(interaction: discord.Interaction, file: discord.Attachment):
+    if not is_vault_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ **تم رفض الوصول.**", ephemeral=True)
+        return
+    if not file.filename.endswith(".json"):
+        await interaction.response.send_message("❌ ليس JSON.", ephemeral=True)
+        return
+    try:
+        content = await file.read()
+        data = json.loads(content.decode('utf-8'))
+    except:
+        await interaction.response.send_message("❌ فشل قراءة الملف.", ephemeral=True)
+        return
+    guild_name = sanitize_filename(data.get("guild_name", "unknown"))
+    filename = f"backup_{guild_name}_{interaction.user.id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+    path = os.path.join(VAULT_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    await interaction.response.send_message(f"✅ تم رفع `{filename}`", ephemeral=True)
+
+@bot.tree.command(name="owner", description="فتح لوحة Ghost Commander السرية")
+async def owner(interaction: discord.Interaction):
+    if interaction.guild is not None:
+        await interaction.response.send_message("⛔ هذا الأمر يعمل في الخاص فقط.", ephemeral=True)
+        return
+    if emergency_state.get("active") and not is_emergency_allowed(interaction.user.id):
+        await interaction.response.send_message("🚨 البوت في حالة طوارئ قصوى. العمليات معلقة.", ephemeral=True)
+        return
+    if not is_ghost_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ **تم رفض الوصول.**", ephemeral=True)
+        return
+    embed = discord.Embed(title="👑 مَركز القيادة السري | Ghost Commander", description=(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n> 🛡️ **مرحباً سيدي. جميع أوامر التحكم جاهزة.**\n\n"
+        "**🔑 الصلاحيات** - إدارة فريق القيادة.\n**🗄️ إدارة النسخ الاحتياطية** - إنشاء، عرض، استرجاع، حذف.\n"
+        "**⚡ طرد فردي** - طرد عضو من سيرفر.\n**🚫 حظر فردي** - حظر عضو من سيرفر.\n"
+        "**⚡ طرد جماعي** - طرد جميع الأعضاء القابلين للطرد.\n**🚫 حظر جماعي** - حظر جميع الأعضاء القابلين للحظر.\n"
+        "**💣 مسح السيرفر** - مسح جميع القنوات والرتب عن بعد.\n**⚡ تفعيل الطوارئ** - يقفل جميع الأزرار.\n"
+        "**🚧 عازل الحماية** - حماية سيرفرات من التدمير.\n**📋 تعميم على السيرفرات** - إرسال رسالة للجميع.\n"
+        "**📊 معلومات السيرفرات** - تفاصيل السيرفرات.\n**📜 سجل الأحداث** - مراجعة العمليات.\n"
+        "**🎭 حالة البوت** - تغيير الظهور.\n**🧹 مسح المحادثة** - مسح رسائل البوت.\n**📖 الدليل الإرشادي** - شرح الأزرار.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👇 **اختر العملية:**"
+    ), color=discord.Color.dark_purple())
+    view = GhostCommanderView(interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view)
+    msg = await interaction.original_response()
+    active_sessions[interaction.user.id] = msg.id
+
+@bot.event
+async def on_ready():
+    await set_bot_presence()
+    logger.info(f"✅ {bot.user} متصل وجاهز")
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"🔄 تم مزامنة {len(synced)} أمر")
+    except Exception as e:
+        logger.error(f"❌ فشلت المزامنة: {e}")
+    cleanup_temp_files()
+    logger.info("🧹 تم تنظيف الملفات المؤقتة")
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
