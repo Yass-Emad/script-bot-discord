@@ -1,0 +1,10 @@
+.anton/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pkl
+token.txt
+*.log
+vault_backups/
+colab_download_repos.ipynb
+download_game_repos_colab.ipynb
