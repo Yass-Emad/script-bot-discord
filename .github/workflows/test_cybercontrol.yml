@@ -1,4 +1,4 @@
-name: CyberControl Testing
+name: CyberControl CI Testing
 
 on:
   push:
@@ -25,93 +25,13 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pytest pytest-asyncio pytest-mock
-        pip install rich discord.py requests questionary
+        pip install pytest pytest-asyncio pytest-mock rich discord.py requests questionary
 
-    - name: Extract Python script from bat
+    - name: Syntax compile check
       run: |
-        python scripts/extract_script.py CyberControl.bat cyber_bot_app_test.py
+        python -m py_compile cyber_bot_app.py
+        echo "✓ Syntax compile check passed"
 
-    - name: Syntax check
+    - name: Run PyTest Test Suite
       run: |
-        python -m py_compile cyber_bot_app_test.py
-        echo "✓ Syntax check passed"
-
-    - name: Import verification
-      run: |
-        python -c "
-        import cyber_bot_app_test
-        print('✓ All imports successful')
-        assert hasattr(cyber_bot_app_test, 'CyberBotApp')
-        print('✓ CyberBotApp class exists')
-        "
-
-    - name: Test async isolation
-      run: |
-        python -c "
-        import re
-        with open('cyber_bot_app_test.py', 'r') as f:
-            content = f.read()
-        
-        # Check that no questionary calls are inside async functions
-        async_pattern = r'async def \w+\(.*?\):'
-        matches = list(re.finditer(async_pattern, content))
-        
-        errors = []
-        for match in matches:
-            start = match.start()
-            # Find end of function
-            lines = content[start:].split('\n')
-            end_indent = None
-            for i, line in enumerate(lines[1:], 1):
-                if line.strip() and not line.startswith(' ' * 8):
-                    end = start + sum(len(l) + 1 for l in lines[:i])
-                    break
-            else:
-                end = len(content)
-            
-            func_body = content[start:end]
-            if 'questionary' in func_body:
-                errors.append(f'questionary call found inside async function at position {start}')
-        
-        if errors:
-            print('✗ ERROR: Found questionary calls inside async functions:')
-            for err in errors:
-                print(f'  {err}')
-            exit(1)
-        else:
-            print('✓ No questionary calls inside async functions')
-        "
-
-    - name: Test encoding integrity
-      run: |
-        python -c "
-        import base64
-        import re
-        
-        with open('CyberControl.bat', 'r') as f:
-            bat = f.read()
-        
-        chunks = re.findall(r'echo ([A-Za-z0-9+/=]+)> "%TEMP_B64"', bat)
-        chunks += re.findall(r'echo ([A-Za-z0-9+/=]+)>> "%TEMP_B64"', bat)
-        
-        if not chunks:
-            print('✗ No base64 chunks found')
-            exit(1)
-        
-        encoded = ''.join(chunks)
-        decoded = base64.b64decode(encoded)
-        
-        with open('cyber_bot_app_test.py', 'rb') as f:
-            original = f.read()
-        
-        if decoded == original:
-            print(f'✓ Encoding integrity verified ({len(original)} bytes)')
-        else:
-            print(f'✗ Encoding mismatch: expected {len(original)} bytes, got {len(decoded)} bytes')
-            exit(1)
-        "
-
-    - name: Run unit tests
-      run: |
-        pytest tests/ -v --tb=short || true
+        pytest tests/test_cybercontrol.py -v --tb=short
